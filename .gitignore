@@ -1,0 +1,22 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pkl
+*.npz
+
+# Generated experiment artifacts (checkpoints, metrics, figures) - these are
+# reproducible by running main.py and can be tens of GB; never commit them.
+EXPERIMENTS/
+EXPERIMENTS_AREA1/
+EXPERIMENTS_AREA2/
+panel_figures/
+monthly_maps_test_2025/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 
 
 class ConvLSTM3DCell(nn.Module):
@@ -43,36 +44,6 @@ class ConvLSTM3DCell(nn.Module):
         return h_next, c_next
 
 
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation block with linear activation."""
-
-    def __init__(self, channels: int, reduction: int = 8):
-        super().__init__()
-        self.fc1 = nn.Linear(channels, channels // reduction)
-        self.fc2 = nn.Linear(channels // reduction, channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = torch.sigmoid(self.fc2(self.fc1(x.mean(dim=(2, 3)))))
-        return x * y.view(x.size(0), -1, 1, 1)
-
-
-class SpatialAttention(nn.Module):
-    """Spatial attention module using mean and max pooling."""
-
-    def __init__(self, kernel_size: int = 5):
-        super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        attn = torch.sigmoid(
-            self.conv(torch.cat([
-                torch.mean(x, dim=1, keepdim=True),
-                torch.max(x, dim=1, keepdim=True)[0]
-            ], dim=1))
-        )
-        return x * attn
-
-
 class ConvLSTM3DEncoder(nn.Module):
     """Encoder: processes input sequence and extracts spatiotemporal features."""
 
@@ -94,8 +65,6 @@ class ConvLSTM3DEncoder(nn.Module):
             nn.Conv2d(input_dim, hidden_dims[-1], 1),
             nn.BatchNorm2d(hidden_dims[-1])
         )
-        self.temp_fc1 = nn.Linear(hidden_dims[-1], max(1, hidden_dims[-1] // 2))
-        self.temp_fc2 = nn.Linear(max(1, hidden_dims[-1] // 2), 1)
         self.layer_norm = nn.LayerNorm(hidden_dims[-1])
         self.bn_skip = nn.BatchNorm2d(hidden_dims[-1])
 
@@ -120,31 +89,24 @@ class ConvLSTM3DEncoder(nn.Module):
         h = [torch.zeros(B, hd, H, W, device=x.device) for hd in self.hidden_dims]
         c = [torch.zeros(B, hd, H, W, device=x.device) for hd in self.hidden_dims]
 
-        # Process sequence
-        temporal = []
+        # Process sequence - simple architecture, no attention: only the
+        # final ConvLSTM hidden state is used (a plain seq-to-one encoder).
         for t in range(P):
             inp = x[:, t]
             for i, cell in enumerate(self.layers):
                 h[i], c[i] = cell(inp, h[i], c[i])
                 inp = h[i]
-            temporal.append(h[-1])
-
-        temporal = torch.stack(temporal, dim=1)
-
-        # Temporal attention pooling
-        pooled = temporal.mean(dim=(3, 4))
-        weights = torch.softmax(self.temp_fc2(self.temp_fc1(pooled)), dim=1)
-        weighted = (temporal * weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+        last_hidden = h[-1]
 
         # Skip connection
         skip = self.skip_proj(x[:, 0])
 
-        if weighted.shape[2:] != skip.shape[2:]:
-            weighted = nn.functional.interpolate(
-                weighted, size=skip.shape[2:], mode='bilinear', align_corners=False
+        if last_hidden.shape[2:] != skip.shape[2:]:
+            last_hidden = nn.functional.interpolate(
+                last_hidden, size=skip.shape[2:], mode='bilinear', align_corners=False
             )
 
-        out = self.bn_skip(weighted + skip)
+        out = self.bn_skip(last_hidden + skip)
 
         if need_resize:
             out = nn.functional.interpolate(
@@ -158,7 +120,7 @@ class ConvLSTM3DEncoder(nn.Module):
         return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_checkpoint and self.training and hasattr(torch, 'checkpoint'):
+        if self.use_checkpoint and self.training and hasattr(torch.utils, 'checkpoint'):
             return torch.utils.checkpoint.checkpoint(
                 self._forward_impl, x, use_reentrant=False
             )
@@ -167,10 +129,20 @@ class ConvLSTM3DEncoder(nn.Module):
 
 class ConvLSTM3D(nn.Module):
     """
-    ConvLSTM3D model for SPI forecasting using delta prediction.
+    Simple ConvLSTM3D model for SPI forecasting using delta prediction.
 
     Strategy: Predict SPI variation (delta) instead of absolute values.
     SPI_predicted = last_observed_SPI + delta_predicted
+
+    Deliberately simple (no channel/spatial/temporal attention): one model
+    is trained per (P, Q) combination, directly mapping the P-step input
+    window to the single target instant Q steps ahead - the same
+    single-target-per-horizon strategy used by
+    drought_forecast_binary/regression, rather than an autoregressive
+    multi-step rollout. This answers whether a plain, hyperparameter-tuned
+    ConvLSTM is competitive with the classical (RF/XGBoost) baselines and
+    with the more elaborate attention-based architectures used elsewhere in
+    this thesis, without the confound of a fancier architecture.
 
     Args:
         hidden: Tuple of hidden channels per layer
@@ -193,8 +165,6 @@ class ConvLSTM3D(nn.Module):
             dropout=dropout_p,
             use_checkpoint=use_checkpoint
         )
-        self.channel_att = SEBlock(hidden[-1])
-        self.spatial_att = SpatialAttention()
 
         # Refinement block with residual connection
         self.refine = nn.Sequential(
@@ -218,11 +188,9 @@ class ConvLSTM3D(nn.Module):
             nn.Conv2d(64, 1, 1)
         )
 
-    def _forward_one_step_impl(self, x: torch.Tensor) -> torch.Tensor:
-        """Predict delta SPI for the next time step."""
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
+        """Predict delta SPI for the target instant."""
         h = self.encoder(x)
-        h = self.channel_att(h)
-        h = self.spatial_att(h)
 
         residual = h
         h = self.refine(h)
@@ -232,9 +200,10 @@ class ConvLSTM3D(nn.Module):
         delta_pred = self.head(h).squeeze(1)
         return delta_pred
 
-    def forward_one_step(self, x: torch.Tensor, use_checkpoint: bool = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, use_checkpoint: bool = None) -> torch.Tensor:
         """
-        Predict absolute SPI for the next time step.
+        Predict absolute SPI for the target instant (Q steps after the
+        input window - see SPIDataset).
 
         Args:
             x: Input tensor [B, P, C, H, W]
@@ -246,50 +215,19 @@ class ConvLSTM3D(nn.Module):
         if use_checkpoint is None:
             use_checkpoint = self.use_checkpoint
 
-        if use_checkpoint and self.training and hasattr(torch, 'checkpoint'):
+        if use_checkpoint and self.training and hasattr(torch.utils, 'checkpoint'):
             delta_pred = torch.utils.checkpoint.checkpoint(
-                self._forward_one_step_impl, x, use_reentrant=False
+                self._forward_impl, x, use_reentrant=False
             )
         else:
-            delta_pred = self._forward_one_step_impl(x)
+            delta_pred = self._forward_impl(x)
 
-        # SPI_pred = last_observed_SPI + delta
+        # SPI_pred = last_observed_SPI + delta. Channel 1 is SPI, last time
+        # step is the most recent observed month (persistence anchor).
         last_spi = x[:, -1, 1]
         spi_pred = last_spi + delta_pred
 
         return spi_pred
-
-    def forecast(self, x_init: torch.Tensor, Q: int) -> torch.Tensor:
-        """
-        Autoregressive forecast for Q steps.
-
-        Args:
-            x_init: Initial input tensor [B, P, C, H, W]
-            Q: Number of steps to forecast
-
-        Returns:
-            predictions: SPI predictions [B, Q, H, W]
-        """
-        B, P, C, H, W = x_init.shape
-        predictions = []
-        current = x_init.clone()
-
-        # Constant precipitation mean from input window
-        pr_mean = current[:, :, 0].mean(dim=1, keepdim=True).squeeze(1)
-
-        for step in range(Q):
-            spi_pred = self.forward_one_step(current, use_checkpoint=False)
-            predictions.append(spi_pred.unsqueeze(1))
-
-            if step < Q - 1:
-                new_input = torch.zeros(B, 1, C, H, W, device=x_init.device, dtype=x_init.dtype)
-                new_input[:, 0, 0] = pr_mean                    # precipitation
-                new_input[:, 0, 1] = spi_pred                   # predicted SPI
-                new_input[:, 0, 2] = spi_pred - current[:, -1, 1]  # delta SPI
-
-                current = torch.cat([current[:, 1:], new_input], dim=1)
-
-        return torch.cat(predictions, dim=1)
 
     def get_config(self) -> dict:
         """Return model configuration for logging."""

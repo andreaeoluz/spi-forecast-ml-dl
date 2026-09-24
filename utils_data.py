@@ -1,11 +1,11 @@
 # utils_data.py - Data loading, SPI calculation, and caching utilities
 
-import os
 import hashlib
+import os
+
 import numpy as np
 import pandas as pd
 from scipy.stats import gamma, norm
-from tqdm import tqdm
 
 
 # ============================================================================

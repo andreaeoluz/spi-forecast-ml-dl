@@ -1,33 +1,37 @@
 # main.py - Main execution script for SPI forecasting experiments
 
+# These two side-effecting calls must run before matplotlib.pyplot or torch
+# are imported anywhere else in the process (directly or transitively), so
+# they are deliberately kept ahead of the normal stdlib/third-party import
+# block below instead of being grouped alphabetically with it.
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for servers
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-import json
 import gc
+import json
 from pathlib import Path
 
-import torch
-import pandas as pd
 import numpy as np
+import pandas as pd
+import torch
 from joblib import dump
+from torch.utils.data import DataLoader
 
 from config import (
     BASE_DIR, METRICS_DIR, DATA_PATH, TRAIN_END_YEAR,
-    SPI_SCALE_FIXED, P_VALUES, Q_VALUES, CONVLSTM3D_PARAMS,
+    SPI_SCALE_FIXED, P_VALUES, Q_VALUES,
     CLASSIC_PARAMS, MIN_TEST_SAMPLES, USE_VAL_AS_TEST_FALLBACK,
-    EVAL_MODE, DEVICE, RANDOM_SEED, GENERATE_VISUALIZATIONS
+    DEVICE, RANDOM_SEED, GENERATE_VISUALIZATIONS
 )
 from utils_data import load_grid_data, load_or_calculate_spi
 from dataset import SPIDataset
 from data_preparation import prepare_classic_data
-from model_convlstm3d import ConvLSTM3D
 from model_classic import run_classic, evaluate_with_fallback
-from train_model import train_model
-from metrics import compute_all_metrics, wi
+from train_model import random_search_convlstm3d
+from metrics import compute_all_metrics
 from visualization_spi import generate_visualizations
 
 
@@ -52,15 +56,6 @@ def setup_environment() -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def create_convlstm_model() -> ConvLSTM3D:
-    """Factory function to create a ConvLSTM3D model with configured parameters."""
-    return ConvLSTM3D(
-        CONVLSTM3D_PARAMS["hidden"],
-        dropout_p=CONVLSTM3D_PARAMS["dropout"],
-        use_checkpoint=CONVLSTM3D_PARAMS.get("use_checkpoint", False)
-    ).to(DEVICE)
-
-
 def get_test_dataset(ds_test, ds_val, P: int, Q: int):
     """
     Determine which dataset to use for testing based on sample availability.
@@ -74,11 +69,13 @@ def get_test_dataset(ds_test, ds_val, P: int, Q: int):
     Returns:
         tuple: (dataset, source_name, n_samples) or (None, "none", 0)
     """
+    # len(ds_test) already counts valid (P, Q) windows for this split
+    # (SPIDataset lets the input look back across the split boundary), so no
+    # further subtraction of (P + Q) is needed here.
     n_test = len(ds_test)
-    max_possible = max(0, n_test - (P + Q) + 1) if n_test > 0 else 0
 
-    if max_possible >= MIN_TEST_SAMPLES:
-        return ds_test, "test", max_possible
+    if n_test >= MIN_TEST_SAMPLES:
+        return ds_test, "test", n_test
     elif USE_VAL_AS_TEST_FALLBACK and len(ds_val) >= MIN_TEST_SAMPLES:
         return ds_val, "validation_as_test", len(ds_val)
 
@@ -87,60 +84,54 @@ def get_test_dataset(ds_test, ds_val, P: int, Q: int):
 
 def evaluate_dl_on_test(model, ds_test, ds_val, Q: int, device, P: int) -> dict:
     """
-    Evaluate deep learning model on test set (or fallback to validation).
+    Evaluate the ConvLSTM3D model on the test set (or fallback to
+    validation) with a single forward pass per sample - there is no
+    autoregressive rollout, since each model predicts one target instant,
+    Q steps ahead of its input window (see SPIDataset).
 
     Args:
         model: Trained ConvLSTM3D model
         ds_test: Test dataset
         ds_val: Validation dataset (fallback)
-        Q: Number of forecast horizons
+        Q: Forecast horizon, in instants ahead (for metadata)
         device: Torch device
         P: Input sequence length (for fallback logic)
 
     Returns:
         dict: Evaluation metrics
     """
-    from torch.utils.data import DataLoader
-
     ds_use, source, n_samples = get_test_dataset(ds_test, ds_val, P, Q)
 
     if ds_use is None:
         return {
             "wi": np.nan, "rmse": np.nan, "mae": np.nan,
-            "wi_by_h": [np.nan] * Q, "test_source": "none", "n_test_samples": 0
+            "test_source": "none", "n_test_samples": 0
         }
 
     loader = DataLoader(ds_use, batch_size=4, shuffle=False)
     model.eval()
 
-    yt_all, yp_all = [], []
-    preds_h = [[] for _ in range(Q)]
-    trues_h = [[] for _ in range(Q)]
+    yt_all, yp_all, mask_all = [], [], []
 
     with torch.no_grad():
-        for x, y_seq in loader:
+        for x, y, y_mask in loader:
             x = x.to(device)
-            y_seq = y_seq.to(device)
+            y = y.to(device)
+            y_mask = y_mask.to(device)
 
-            y_pred = model.forecast(x, Q)
+            y_pred = model(x)
 
-            yt_all.append(y_seq.reshape(y_seq.size(0), -1))
-            yp_all.append(y_pred.reshape(y_pred.size(0), -1))
-
-            for h in range(Q):
-                preds_h[h].append(y_pred[:, h].reshape(-1))
-                trues_h[h].append(y_seq[:, h].reshape(-1))
+            yt_all.append(y.reshape(-1))
+            yp_all.append(y_pred.reshape(-1))
+            mask_all.append(y_mask.reshape(-1))
 
     yt_all = torch.cat(yt_all, dim=0)
     yp_all = torch.cat(yp_all, dim=0)
+    mask_all = torch.cat(mask_all, dim=0)
 
-    metrics = compute_all_metrics(yt_all, yp_all)
+    metrics = compute_all_metrics(yt_all, yp_all, mask=mask_all)
     metrics["test_source"] = source
     metrics["n_test_samples"] = n_samples
-    metrics["wi_by_h"] = [
-        float(wi(torch.cat(trues_h[h]), torch.cat(preds_h[h])))
-        for h in range(Q)
-    ]
 
     return metrics
 
@@ -197,11 +188,12 @@ def print_experiment_header() -> None:
 def print_data_split_info(indices: tuple, dates) -> None:
     """Print data split information."""
     train_idx, val_idx, test_idx = indices
+    train_start_year = dates[train_idx[0]].year if len(train_idx) > 0 else "?"
     test_start_date = dates[test_idx[0]] if len(test_idx) > 0 else None
     test_end_date = dates[test_idx[-1]] if len(test_idx) > 0 else None
 
-    print(f"\nPeriod sizes:")
-    print(f"  Training   : {len(train_idx)} months (1994-{TRAIN_END_YEAR})")
+    print("\nPeriod sizes:")
+    print(f"  Training   : {len(train_idx)} months ({train_start_year}-{TRAIN_END_YEAR})")
 
     if test_start_date:
         print(f"  Validation : {len(val_idx)} months ({TRAIN_END_YEAR + 1} to {test_start_date.year - 1}-12)")
@@ -247,22 +239,16 @@ def save_classic_model_artifacts(res: dict, combo_dir: Path, model_name: str,
     }
     pd.DataFrame(metrics_data).to_excel(classic_dir / "metrics.xlsx", index=False)
 
-    # Save per-horizon WI
-    if "wi_by_h" in test_metrics and test_metrics["wi_by_h"]:
-        wi_by_h_data = {
-            "horizon": list(range(1, res["Q"] + 1)),
-            "wi": test_metrics["wi_by_h"]
-        }
-        pd.DataFrame(wi_by_h_data).to_excel(classic_dir / "wi_by_horizon.xlsx", index=False)
-
     # Save cross-validation results
     if res.get("cv_results"):
         cv_df = pd.DataFrame(res["cv_results"])
         cv_df.to_excel(classic_dir / "cv_results.xlsx", index=False)
 
 
-def save_dl_model_artifacts(model, combo_dir: Path, test_metrics: dict, P: int, Q: int) -> None:
-    """Save deep learning model artifacts."""
+def save_dl_model_artifacts(model, best_params: dict, combo_dir: Path,
+                             test_metrics: dict, P: int, Q: int) -> None:
+    """Save deep learning model artifacts (best candidate from the
+    hyperparameter search - see train_model.random_search_convlstm3d)."""
     conv_dir = combo_dir / "ConvLSTM3D"
     conv_dir.mkdir(exist_ok=True)
 
@@ -273,9 +259,15 @@ def save_dl_model_artifacts(model, combo_dir: Path, test_metrics: dict, P: int, 
         "Q": Q,
         "best_wi_val": model.best_wi,
         "test_wi": test_metrics["wi"],
-        "hidden": CONVLSTM3D_PARAMS["hidden"],
-        "dropout": CONVLSTM3D_PARAMS["dropout"]
+        "hidden": best_params["hidden"],
+        "dropout": best_params["dropout"],
+        "lr": best_params["lr"],
+        "batch_size": best_params["batch_size"],
     }, conv_dir / "best_model.pt")
+
+    # Save best hyperparameters (search over CONVLSTM3D_SPACE)
+    with open(conv_dir / "best_params.json", "w") as f:
+        json.dump(best_params, f, indent=4)
 
     # Save metrics
     metrics_data = {
@@ -290,14 +282,6 @@ def save_dl_model_artifacts(model, combo_dir: Path, test_metrics: dict, P: int, 
         ]
     }
     pd.DataFrame(metrics_data).to_excel(conv_dir / "metrics.xlsx", index=False)
-
-    # Save per-horizon WI
-    if "wi_by_h" in test_metrics and test_metrics["wi_by_h"]:
-        wi_by_h_data = {
-            "horizon": list(range(1, Q + 1)),
-            "wi": test_metrics["wi_by_h"]
-        }
-        pd.DataFrame(wi_by_h_data).to_excel(conv_dir / "wi_by_horizon.xlsx", index=False)
 
 
 # ============================================================================
@@ -358,40 +342,44 @@ def main() -> None:
             combo_dir.mkdir(exist_ok=True)
 
             # ==================== CONVLSTM3D ====================
+            # Hyperparameter search over CONVLSTM3D_SPACE (config.py),
+            # analogous to RF/XGBoost's RandomizedSearchCV below - see
+            # train_model.random_search_convlstm3d for why it can't reuse
+            # RandomizedSearchCV directly (no k-fold CV, single train/val
+            # split per candidate).
             print("\n[ConvLSTM3D]")
-            model = create_convlstm_model()
-            model = train_model(
-                model, ds_train, ds_val, P, Q,
-                epochs=CONVLSTM3D_PARAMS["epochs"],
-                lr=CONVLSTM3D_PARAMS["lr"],
-                batch_size=CONVLSTM3D_PARAMS["batch_size"],
-                device=DEVICE,
-                patience=CONVLSTM3D_PARAMS["patience"],
-                eval_mode=EVAL_MODE
-            )
+            dl_res = random_search_convlstm3d(ds_train, ds_val, P, Q, device=DEVICE)
+            model = dl_res["model"]
 
-            test_metrics = evaluate_dl_on_test(model, ds_test_raw, ds_val, Q, DEVICE, P)
-            print(f"Test WI = {test_metrics['wi']:.4f}, RMSE = {test_metrics['rmse']:.4f}")
+            if model is None:
+                print("  No training data available")
+            else:
+                test_metrics = evaluate_dl_on_test(model, ds_test_raw, ds_val, Q, DEVICE, P)
+                print(f"Test WI = {test_metrics['wi']:.4f}, RMSE = {test_metrics['rmse']:.4f}")
 
-            # Store results
-            results_test.append({"model": "ConvLSTM3D", "P": P, "Q": Q, **test_metrics})
-            results_val.append({"model": "ConvLSTM3D", "P": P, "Q": Q, "wi_val": model.best_wi})
+                # Store results
+                results_test.append({"model": "ConvLSTM3D", "P": P, "Q": Q, **test_metrics})
+                results_val.append({"model": "ConvLSTM3D", "P": P, "Q": Q, "wi_val": model.best_wi})
+                best_params_list.append({
+                    "model": "ConvLSTM3D", "P": P, "Q": Q,
+                    "params": json.dumps(dl_res["best_params"])
+                })
 
-            # Generate visualizations
-            if GENERATE_VISUALIZATIONS:
-                vis_period = "test" if test_source == "test" else "val"
-                if vis_period == "val":
-                    print("  Note: Using validation period for visualizations (fallback)")
+                # Generate visualizations
+                if GENERATE_VISUALIZATIONS:
+                    vis_period = "test" if test_source == "test" else "val"
+                    if vis_period == "val":
+                        print("  Note: Using validation period for visualizations (fallback)")
 
-                vis_dir = combo_dir / "ConvLSTM3D" / "visualizations"
-                vis_dir.mkdir(parents=True, exist_ok=True)
+                    vis_dir = combo_dir / "ConvLSTM3D" / "visualizations"
+                    vis_dir.mkdir(parents=True, exist_ok=True)
 
-                generate_visualizations(
-                    model, df_pr, df_spi, P, Q, indices, DEVICE,
-                    "ConvLSTM3D", str(vis_dir), vis_period, "lstm"
-                )
+                    generate_visualizations(
+                        model, df_pr, df_spi, P, Q, indices, DEVICE,
+                        "ConvLSTM3D", str(vis_dir), vis_period, "lstm"
+                    )
 
-            save_dl_model_artifacts(model, combo_dir, test_metrics, P, Q)
+                save_dl_model_artifacts(model, dl_res["best_params"], combo_dir, test_metrics, P, Q)
 
             # ==================== CLASSICAL MODELS ====================
             print("\n[Classical models] Preparing data...")
@@ -424,7 +412,7 @@ def main() -> None:
 
                 # Evaluate
                 test_metrics = evaluate_with_fallback(
-                    res["model"], X_test, Y_test, X_val, Y_val, Q,
+                    res["model"], X_test, Y_test, X_val, Y_val,
                     min_samples=MIN_TEST_SAMPLES
                 )
 
@@ -464,27 +452,6 @@ def main() -> None:
     df_test = pd.DataFrame(results_test)
 
     if not df_test.empty:
-        # Parse wi_by_h lists if stored as strings
-        for idx, row in df_test.iterrows():
-            if "wi_by_h" in row and isinstance(row["wi_by_h"], str):
-                df_test.at[idx, "wi_by_h"] = eval(row["wi_by_h"])
-
-        # Build per-horizon table
-        rows_wi_h = []
-        for _, row in df_test.iterrows():
-            wi_by_h = row.get("wi_by_h")
-            if wi_by_h is not None and isinstance(wi_by_h, (list, tuple)):
-                for h, wi_val in enumerate(wi_by_h, start=1):
-                    if not np.isnan(wi_val):
-                        rows_wi_h.append({
-                            "model": row["model"],
-                            "P": row["P"],
-                            "Q": row["Q"],
-                            "horizon": h,
-                            "wi_test": wi_val,
-                            "test_source": row.get("test_source", "unknown")
-                        })
-
         # Generate summaries
         summary_by_model, best_per_model, wi_heatmap = save_results_summary(df_test)
 
@@ -492,11 +459,12 @@ def main() -> None:
         excel_path = METRICS_DIR / "test_results_all_models.xlsx"
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
             df_test.to_excel(writer, sheet_name="Test_Metrics", index=False)
-            if rows_wi_h:
-                pd.DataFrame(rows_wi_h).to_excel(writer, sheet_name="WI_by_Horizon", index=False)
             summary_by_model.to_excel(writer, sheet_name="Model_Summary", index=False)
             best_per_model.to_excel(writer, sheet_name="Best_Per_Model", index=False)
             wi_heatmap.to_excel(writer, sheet_name="WI_Heatmap", index=False)
+
+        if best_params_list:
+            pd.DataFrame(best_params_list).to_excel(METRICS_DIR / "best_params_all_models.xlsx", index=False)
 
         print(f"Results saved to: {excel_path}")
 
@@ -508,7 +476,7 @@ def main() -> None:
         if df_test['wi'].notna().any():
             best_idx = df_test['wi'].idxmax()
             best = df_test.loc[best_idx]
-            print(f"\nBest overall configuration:")
+            print("\nBest overall configuration:")
             print(f"  Model: {best['model']}")
             print(f"  P = {int(best['P'])}, Q = {int(best['Q'])}")
             print(f"  WI = {best['wi']:.4f}, RMSE = {best['rmse']:.4f}, MAE = {best['mae']:.4f}")

@@ -1,10 +1,17 @@
 # metrics.py - Evaluation metrics for drought forecasting
 
 import torch
-import numpy as np
 
 
-def wi(yt: torch.Tensor, yp: torch.Tensor) -> torch.Tensor:
+def _valid_mask(yt: torch.Tensor, yp: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    """Combine finiteness with an optional external validity mask (>0.5 = valid)."""
+    valid = torch.isfinite(yt) & torch.isfinite(yp)
+    if mask is not None:
+        valid = valid & (mask > 0.5)
+    return valid
+
+
+def wi(yt: torch.Tensor, yp: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
     """
     Willmott's Index of Agreement (WI).
 
@@ -14,12 +21,17 @@ def wi(yt: torch.Tensor, yp: torch.Tensor) -> torch.Tensor:
     Args:
         yt: Ground truth values
         yp: Predicted values
+        mask: Optional validity mask, same shape as yt/yp (>0.5 = valid).
+            Required whenever yt/yp may contain zero-filled placeholders for
+            pixels/months where SPI could not be computed: those
+            placeholders are finite (0.0) and would otherwise be silently
+            scored as real observations.
 
     Returns:
         WI value as a torch.Tensor (scalar)
     """
-    mask = torch.isfinite(yt) & torch.isfinite(yp)
-    yt, yp = yt[mask], yp[mask]
+    valid = _valid_mask(yt, yp, mask)
+    yt, yp = yt[valid], yp[valid]
 
     if yt.numel() == 0:
         return torch.tensor(float("nan"))
@@ -31,19 +43,20 @@ def wi(yt: torch.Tensor, yp: torch.Tensor) -> torch.Tensor:
     return 1 - sse / denom
 
 
-def rmse(yt: torch.Tensor, yp: torch.Tensor) -> torch.Tensor:
+def rmse(yt: torch.Tensor, yp: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
     """
     Root Mean Square Error (RMSE).
 
     Args:
         yt: Ground truth values
         yp: Predicted values
+        mask: Optional validity mask, same shape as yt/yp (>0.5 = valid).
 
     Returns:
         RMSE value as a torch.Tensor (scalar)
     """
-    mask = torch.isfinite(yt) & torch.isfinite(yp)
-    yt, yp = yt[mask], yp[mask]
+    valid = _valid_mask(yt, yp, mask)
+    yt, yp = yt[valid], yp[valid]
 
     if yt.numel() == 0:
         return torch.tensor(float("nan"))
@@ -51,19 +64,20 @@ def rmse(yt: torch.Tensor, yp: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(torch.mean((yt - yp) ** 2))
 
 
-def mae(yt: torch.Tensor, yp: torch.Tensor) -> torch.Tensor:
+def mae(yt: torch.Tensor, yp: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
     """
     Mean Absolute Error (MAE).
 
     Args:
         yt: Ground truth values
         yp: Predicted values
+        mask: Optional validity mask, same shape as yt/yp (>0.5 = valid).
 
     Returns:
         MAE value as a torch.Tensor (scalar)
     """
-    mask = torch.isfinite(yt) & torch.isfinite(yp)
-    yt, yp = yt[mask], yp[mask]
+    valid = _valid_mask(yt, yp, mask)
+    yt, yp = yt[valid], yp[valid]
 
     if yt.numel() == 0:
         return torch.tensor(float("nan"))
@@ -71,43 +85,20 @@ def mae(yt: torch.Tensor, yp: torch.Tensor) -> torch.Tensor:
     return torch.mean(torch.abs(yt - yp))
 
 
-def compute_all_metrics(yt: torch.Tensor, yp: torch.Tensor) -> dict:
+def compute_all_metrics(yt: torch.Tensor, yp: torch.Tensor, mask: torch.Tensor = None) -> dict:
     """
     Compute all three metrics (WI, RMSE, MAE) at once.
 
     Args:
         yt: Ground truth values
         yp: Predicted values
+        mask: Optional validity mask, same shape as yt/yp (>0.5 = valid).
 
     Returns:
         Dictionary with keys: "wi", "rmse", "mae"
     """
     return {
-        "wi": float(wi(yt, yp)),
-        "rmse": float(rmse(yt, yp)),
-        "mae": float(mae(yt, yp))
+        "wi": float(wi(yt, yp, mask)),
+        "rmse": float(rmse(yt, yp, mask)),
+        "mae": float(mae(yt, yp, mask))
     }
-
-
-def select_eval_mode(metric_h: list, mode: str = "last") -> float:
-    """
-    Aggregate per-horizon metrics according to evaluation mode.
-
-    Args:
-        metric_h: List of metric values per horizon
-        mode: Aggregation mode - "last", "best_of_h", or "mean"
-
-    Returns:
-        Aggregated metric value
-    """
-    arr = np.array(metric_h)
-
-    if len(arr) == 0:
-        return np.nan
-
-    if mode == "last":
-        return arr[-1]
-    if mode == "best_of_h":
-        return np.nanmax(arr)
-
-    return np.nanmean(arr)  # "mean" mode (default fallback)

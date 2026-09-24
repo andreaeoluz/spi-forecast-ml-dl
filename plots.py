@@ -10,13 +10,27 @@ from matplotlib.ticker import FuncFormatter
 # CONSTANTS
 # ============================================================================
 
-CMAP_SPI = 'RdBu'
+CMAP_SPI = 'RdBu'          # low SPI (drought) -> red, high SPI (wet) -> blue
 CMAP_SPI_CLASSES = ListedColormap([
     "#8B0000", "#CD5C5C", "#F4A460", "#FFD700",
     "#ADFF2F", "#32CD32", "#006400"
 ])
 CMAP_ERROR = 'YlOrRd'
 CMAP_ACC = 'YlGn'
+CMAP_WI = 'RdYlBu_r'       # low WI (poor skill) -> red, high WI (good skill) -> blue
+
+# Consistent per-model identity (color + marker) for line/bar plots comparing
+# ConvLSTM3D, RF and XGBoost across figures.
+MODEL_COLORS = {
+    "ConvLSTM3D": "#1b4f72",
+    "RF": "#c0392b",
+    "XGBoost": "#1e8449",
+}
+MODEL_MARKERS = {
+    "ConvLSTM3D": "o",
+    "RF": "s",
+    "XGBoost": "^",
+}
 
 
 # ============================================================================
@@ -26,12 +40,14 @@ CMAP_ACC = 'YlGn'
 def set_journal_style() -> None:
     """Set matplotlib parameters for publication-ready figures."""
     plt.rcParams.update({
-        "font.family": "serif",
+        "font.family": "sans-serif",
+        "font.sans-serif": ["DejaVu Sans"],
         "axes.titlesize": 11,
         "axes.labelsize": 10,
-        "xtick.labelsize": 8,
-        "ytick.labelsize": 8,
-        "figure.dpi": 300
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "legend.fontsize": 8,
+        "figure.dpi": 300,
     })
 
 

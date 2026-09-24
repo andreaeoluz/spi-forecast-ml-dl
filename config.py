@@ -38,15 +38,36 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ============================================================================
 # CONVLSTM3D HYPERPARAMETERS
 # ============================================================================
+# Fallback/default configuration, used only if hyperparameter search is
+# skipped. Normally each (P, Q) combination is retrained under every
+# candidate in CONVLSTM3D_SPACE (see train_model.random_search_convlstm3d)
+# and the best-by-validation-WI candidate is kept, the same principle as
+# RF_SPACE/XGB_SPACE's RandomizedSearchCV below - the search itself can't
+# reuse RandomizedSearchCV (that requires a scikit-learn-style estimator),
+# so it is a manual random search with a single train/val split per
+# candidate rather than k-fold CV (retraining a ConvLSTM k times per
+# candidate would be too expensive).
 CONVLSTM3D_PARAMS = {
     "batch_size": 16,
     "epochs": 100,
-    "lr": 0.0001,
-    "hidden": (64, 32, 16),
+    "lr": 1e-4,
+    "hidden": (32, 16, 8),
     "dropout": 0.3,
     "patience": 10,
     "use_checkpoint": True,
 }
+
+CONVLSTM3D_SPACE = {
+    "hidden": [
+        (32, 16, 8),
+        (64, 32, 16),
+    ],
+    "dropout": [0.2, 0.3],
+    "lr": [1e-3, 1e-4],
+    "batch_size": [16, 32],
+}
+
+CONVLSTM3D_SEARCH_ITER = 6
 
 # ============================================================================
 # CLASSICAL MODELS (RF, XGBoost) CONFIGURATION
@@ -63,7 +84,6 @@ CLASSIC_PARAMS = {
 # ============================================================================
 MIN_TEST_SAMPLES = 1
 USE_VAL_AS_TEST_FALLBACK = True
-EVAL_MODE = "last"           # "last" or "best"
 
 # ============================================================================
 # REPRODUCIBILITY & VISUALIZATION

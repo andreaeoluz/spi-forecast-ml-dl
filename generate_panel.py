@@ -7,32 +7,31 @@ Each horizon corresponds to a specific future month from the base date.
 Also exports each image as individual GeoTIFF files.
 """
 
-import os
 import json
+import os
 from pathlib import Path
 
-import torch
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import rasterio
+import torch
 from joblib import load
 from matplotlib.colors import TwoSlopeNorm
-import rasterio
-from rasterio.transform import from_origin
 from rasterio.crs import CRS
+from rasterio.transform import from_origin
 
+from config import BASE_DIR, DATA_PATH, REF_DATE, SPI_SCALE_FIXED, TRAIN_END_YEAR
 from dataset import SPIDataset
-from utils_data import load_grid_data, load_or_calculate_spi
 from model_convlstm3d import ConvLSTM3D
-from model_classic import predict_multioutput
-from plots import set_journal_style
-from config import DATA_PATH, SPI_SCALE_FIXED, BASE_DIR
+from plots import CMAP_SPI, set_journal_style
+from utils_data import load_grid_data, load_or_calculate_spi
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-P_FIXED = 3  # Fixed past window (P = 3, 6, 9, or 12)
+P_FIXED = 12  # Fixed past window (P = 3, 6, 9, or 12)
 
 # Base date for prediction (last observed date in the input window)
 BASE_DATE = "2024-12"  # December 2024 is the last observed month
@@ -190,18 +189,19 @@ def get_observed_spi_for_date(date, df_spi, lats, lons) -> np.ndarray:
 
 
 def get_predictions_for_horizon(model, model_type: str, x_tensor: torch.Tensor,
-                                P: int, Q: int, target_horizon: int,
                                 lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
     """
-    Get prediction for specific horizon.
+    Get the single-instant prediction from a model trained for one specific
+    (P, Q) - a single forward pass, no autoregressive rollout (each model
+    already predicts exactly one target instant, Q steps past its input
+    window - see SPIDataset). Every caller of this function loads a model
+    trained specifically for the Q it wants, so there is no separate
+    "target_horizon" to select afterward.
 
     Args:
         model: Trained model
         model_type: "ConvLSTM3D", "RF", or "XGBoost"
         x_tensor: Input tensor [1, P, 3, H, W]
-        P: Past window length
-        Q: Model's forecast horizon (must be >= target_horizon)
-        target_horizon: Desired lead time (1-indexed, <= Q)
         lats, lons: Grid coordinates
 
     Returns:
@@ -211,11 +211,7 @@ def get_predictions_for_horizon(model, model_type: str, x_tensor: torch.Tensor,
 
     if model_type == "ConvLSTM3D":
         with torch.no_grad():
-            if target_horizon == 1:
-                pred = model.forward_one_step(x_tensor)
-            else:
-                pred_seq = model.forecast(x_tensor, target_horizon)
-                pred = pred_seq[:, target_horizon - 1, :, :]
+            pred = model(x_tensor)
         return pred.detach().cpu().numpy().squeeze()
 
     else:  # RF or XGBoost
@@ -248,17 +244,10 @@ def get_predictions_for_horizon(model, model_type: str, x_tensor: torch.Tensor,
         X_all = np.asarray(X_all, dtype=np.float32)
         X_all = np.nan_to_num(X_all, nan=0.0)
 
-        # Predict all horizons at once
-        preds_all = predict_multioutput(model, X_all, Q)  # [n_pixels, Q]
+        preds_all = model.predict(X_all)
 
-        # Check if target_horizon is within range
-        horizon_idx = target_horizon - 1
-        if horizon_idx >= preds_all.shape[1]:
-            return np.full((H, W), np.nan)
-
-        # Reconstruct grid for specific horizon
         pred_grid = np.full((H, W), np.nan)
-        for pred, (i, j) in zip(preds_all[:, horizon_idx], pixel_positions):
+        for pred, (i, j) in zip(preds_all, pixel_positions):
             pred_grid[i, j] = pred
 
         return pred_grid
@@ -313,9 +302,9 @@ def main():
     df_spi, indices = load_or_calculate_spi(
         df_pr,
         scale=SPI_SCALE_FIXED,
-        train_end_year=2018,
-        ref_date="2024-12",
-        cache_dir="EXPERIMENTS",
+        train_end_year=TRAIN_END_YEAR,
+        ref_date=REF_DATE,
+        cache_dir=str(BASE_DIR),
         force_recompute=False
     )
 
@@ -383,7 +372,7 @@ def main():
                 continue
 
             pred = get_predictions_for_horizon(
-                model, model_name, x_tensor_device, P_FIXED, q, q, lats, lons
+                model, model_name, x_tensor_device, lats, lons
             )
 
             predictions_by_horizon[q][model_name] = pred
@@ -457,7 +446,7 @@ def main():
         axes = axes.reshape(1, -1)
 
     vmin, vmax = -3, 3
-    cmap = 'RdBu_r'
+    cmap = CMAP_SPI  # low SPI (drought) -> red, high SPI (wet) -> blue; shared with generate_monthly_maps.py
     norm = TwoSlopeNorm(vmin=vmin, vcenter=0, vmax=vmax)
 
     extent = [lons.min(), lons.max(), lats.min(), lats.max()]

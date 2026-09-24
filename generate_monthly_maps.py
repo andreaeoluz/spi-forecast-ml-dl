@@ -5,27 +5,26 @@ Generate monthly SPI prediction maps for ConvLSTM3D, RF and XGBoost models
 using test period (2025 only - 12 months). Also exports each map as GeoTIFF.
 """
 
-import os
 import json
+import os
 from pathlib import Path
 
-import torch
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from joblib import load
 import rasterio
-from rasterio.transform import from_origin
-from rasterio.crs import CRS
+import torch
+from joblib import load
 from matplotlib.ticker import FuncFormatter
+from rasterio.crs import CRS
+from rasterio.transform import from_origin
 
+from config import BASE_DIR, DATA_PATH, REF_DATE, SPI_SCALE_FIXED, TRAIN_END_YEAR
 from dataset import SPIDataset
-from utils_data import load_grid_data, load_or_calculate_spi
-from model_convlstm3d import ConvLSTM3D
-from plots import set_journal_style
-from model_classic import predict_multioutput
-from config import DATA_PATH, TRAIN_END_YEAR, REF_DATE, SPI_SCALE_FIXED, BASE_DIR
 from metrics import compute_all_metrics
+from model_convlstm3d import ConvLSTM3D
+from plots import CMAP_SPI, set_journal_style
+from utils_data import load_grid_data, load_or_calculate_spi
 
 # ============================================================================
 # CONFIGURATION
@@ -37,7 +36,12 @@ EXPERIMENTS_BASE = BASE_DIR
 TEST_START_YEAR = 2025
 TEST_END_YEAR = 2025
 
-HORIZON = 1  # Lead time for monthly maps (1-step ahead)
+# Vestigial label used only for file/figure naming below; each loaded model
+# now predicts its own single target instant Q steps ahead of its input
+# window directly (see SPIDataset), so there is no longer a script-wide
+# "horizon" that drives prediction logic - only get_input_target's per-model
+# (P, Q) matters for that.
+HORIZON = 1
 
 MODELS_TO_PROCESS = ["ConvLSTM3D", "RF", "XGBoost"]
 
@@ -142,9 +146,11 @@ def load_classic_model(exp_dir: str, model_name: str):
 # PREDICTION FUNCTIONS
 # ============================================================================
 
-def predict_classic(model, x_tensor: torch.Tensor, P: int, Q: int,
+def predict_classic(model, x_tensor: torch.Tensor,
                     lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
-    """Generate prediction for classical model (RF or XGBoost)."""
+    """Generate the single-instant prediction for a classical model (RF or
+    XGBoost). `x_tensor`'s window must already be built for this model's
+    own (P, Q) - see get_input_target."""
     H, W = len(lats), len(lons)
     x_np = x_tensor.detach().cpu().numpy()
 
@@ -170,32 +176,27 @@ def predict_classic(model, x_tensor: torch.Tensor, P: int, Q: int,
             pixel_positions.append((i, j))
 
     if len(X_all) == 0:
-        print(f"  ⚠ No valid pixels found for prediction")
+        print("  ⚠ No valid pixels found for prediction")
         return np.full((H, W), np.nan)
 
     X_all = np.asarray(X_all, dtype=np.float32)
     X_all = np.nan_to_num(X_all, nan=0.0)
 
-    # Predict all horizons at once
-    preds = predict_multioutput(model, X_all, Q)  # [n_pixels, Q]
+    preds = model.predict(X_all)
 
-    # Return first horizon (h=0)
     spi_pred = np.full((H, W), np.nan)
-    for pred, (i, j) in zip(preds[:, 0], pixel_positions):
+    for pred, (i, j) in zip(preds, pixel_positions):
         spi_pred[i, j] = pred
 
     return spi_pred
 
 
-def get_prediction_convlstm(model, x_tensor: torch.Tensor, horizon: int = 1) -> np.ndarray:
-    """Return ConvLSTM3D prediction for given horizon."""
+def get_prediction_convlstm(model, x_tensor: torch.Tensor) -> np.ndarray:
+    """Return the ConvLSTM3D's single-instant prediction: a single forward
+    pass, no autoregressive rollout. `x_tensor`'s window must already be
+    built for this model's own (P, Q) - see get_input_target."""
     with torch.no_grad():
-        if horizon == 1:
-            spi_pred = model.forward_one_step(x_tensor)
-        else:
-            pred_seq = model.forecast(x_tensor, horizon)
-            spi_pred = pred_seq[:, horizon - 1, :, :]
-
+        spi_pred = model(x_tensor)
         return spi_pred.detach().cpu().numpy().squeeze()
 
 
@@ -203,23 +204,29 @@ def get_prediction_convlstm(model, x_tensor: torch.Tensor, horizon: int = 1) -> 
 # DATA EXTRACTION
 # ============================================================================
 
-def get_input_target(target_date, df_pr, df_spi, dates, lats, lons, P: int):
+def get_input_target(target_date, df_pr, df_spi, dates, lats, lons, P: int, Q: int):
     """
     For a target date, returns:
         x_tensor: [1, P, 3, H, W] (model input)
         spi_real: [H, W] (observed SPI at target date)
+
+    The input window ends Q instants before `target_date` (not immediately
+    before it): the model this window feeds was trained to map a P-step
+    window directly to the single target Q steps past its end (see
+    SPIDataset), so the window must be shifted back by Q to land exactly on
+    `target_date` as that target.
     """
     H, W = len(lats), len(lons)
     idx_target = list(dates).index(target_date)
-    idx_start = idx_target - P
+    idx_start = idx_target - P - Q + 1
 
     if idx_start < 0:
-        raise ValueError(f"Insufficient data before {target_date} (P={P})")
+        raise ValueError(f"Insufficient data before {target_date} (P={P}, Q={Q})")
 
     x_pr = np.full((P, H, W), np.nan, dtype=np.float32)
     x_spi = np.full((P, H, W), np.nan, dtype=np.float32)
 
-    for t, idx_t in enumerate(range(idx_start, idx_target)):
+    for t, idx_t in enumerate(range(idx_start, idx_start + P)):
         date_t = dates[idx_t]
 
         grid_pr = (df_pr[date_t].unstack(level=1).reindex(index=lats, columns=lons))
@@ -311,7 +318,7 @@ def create_figure_journal(observed: np.ndarray, predicted: np.ndarray, date,
 
     extent = [lons.min(), lons.max(), lats.min(), lats.max()]
     vmin, vmax = -3, 3
-    cmap = 'RdBu'
+    cmap = CMAP_SPI
 
     xticks = np.linspace(lons.min(), lons.max(), 4)
     yticks = np.linspace(lats.min(), lats.max(), 4)
@@ -377,7 +384,7 @@ def create_comparison_figure(observed: np.ndarray, predictions: dict, date,
 
     extent = [lons.min(), lons.max(), lats.min(), lats.max()]
     vmin, vmax = -3, 3
-    cmap = 'RdBu'
+    cmap = CMAP_SPI
 
     xticks = np.linspace(lons.min(), lons.max(), 4)
     yticks = np.linspace(lats.min(), lats.max(), 4)
@@ -518,7 +525,7 @@ def main():
         if P is not None:
             model_configs[model_name] = {"P": P, "Q": Q}
 
-    print(f"\nSelected configurations:")
+    print("\nSelected configurations:")
     for model_name, cfg in model_configs.items():
         print(f"  {model_name}: P={cfg['P']}, Q={cfg['Q']}")
 
@@ -587,17 +594,14 @@ def main():
         for i, date in enumerate(selected_dates):
             print(f"\nProcessing {i+1}/{len(selected_dates)}: {date.date()}...")
 
-            # Use first model's P for input extraction (all models use same P)
-            first_model = list(loaded_models.keys())[0]
-            P_first = loaded_models[first_model]["P"]
-
             try:
-                x_tensor, spi_real = get_input_target(
-                    date, df_pr, df_spi, dates, lats, lons, P_first
+                # spi_real (ground truth at target_date) doesn't depend on
+                # (P, Q) - any loaded model's config works to fetch it here.
+                first_model = list(loaded_models.keys())[0]
+                cfg_first = loaded_models[first_model]
+                _, spi_real = get_input_target(
+                    date, df_pr, df_spi, dates, lats, lons, cfg_first["P"], cfg_first["Q"]
                 )
-
-                # Move to device
-                x_tensor = x_tensor.to(DEVICE)
 
                 all_predictions[date] = {"real": spi_real, "models": {}}
 
@@ -613,22 +617,18 @@ def main():
                     P_model = model_info["P"]
                     Q_model = model_info["Q"]
 
-                    # Use appropriate input window size for each model
-                    if P_model != P_first:
-                        x_tensor_model, _ = get_input_target(
-                            date, df_pr, df_spi, dates, lats, lons, P_model
-                        )
-                        x_tensor_model = x_tensor_model.to(DEVICE)
-                    else:
-                        x_tensor_model = x_tensor
+                    # Each model's window must be built for its own (P, Q) -
+                    # see get_input_target's docstring.
+                    x_tensor_model, _ = get_input_target(
+                        date, df_pr, df_spi, dates, lats, lons, P_model, Q_model
+                    )
+                    x_tensor_model = x_tensor_model.to(DEVICE)
 
                     # Generate prediction
                     if model_name == "ConvLSTM3D":
-                        spi_pred = get_prediction_convlstm(model, x_tensor_model, HORIZON)
+                        spi_pred = get_prediction_convlstm(model, x_tensor_model)
                     else:
-                        spi_pred = predict_classic(
-                            model, x_tensor_model, P_model, Q_model, lats, lons
-                        )
+                        spi_pred = predict_classic(model, x_tensor_model, lats, lons)
 
                     all_predictions[date]["models"][model_name] = spi_pred
 
@@ -645,8 +645,8 @@ def main():
                     if mask.sum() > 0:
                         obs_tensor = torch.tensor(spi_real[mask], dtype=torch.float32)
                         pred_tensor = torch.tensor(spi_pred[mask], dtype=torch.float32)
-                        
-                        # Calcula WI, RMSE e MAE em um único passo
+
+                        # Compute WI, RMSE and MAE in a single call
                         all_metrics = compute_all_metrics(obs_tensor, pred_tensor)
                         
                         monthly_metrics[model_name].append({
@@ -681,7 +681,7 @@ def main():
                     comp_fname = panel_dir / f"comparison_{date.strftime('%Y%m')}_h{HORIZON}.pdf"
                     plt.savefig(comp_fname, dpi=300, bbox_inches='tight')
                     plt.close(fig_comp)
-                    print(f"    ✅ Comparison figure saved")
+                    print("    ✅ Comparison figure saved")
 
             except Exception as e:
                 print(f"  ❌ Error on {date.date()}: {e}")
@@ -760,7 +760,7 @@ def main():
 
     print(f"  ✅ Metadata saved to {metadata_path}")
 
-    print(f"\n" + "=" * 70)
+    print("\n" + "=" * 70)
     print("PROCESSING COMPLETE!")
     print(f"Files saved in: {out_dir.resolve()}")
     print(f"TIFF files saved in: {tiff_dir.resolve()}")
@@ -775,10 +775,10 @@ def main():
     print(f"Total TIFFs exported: {len(selected_dates) * (1 + len(loaded_models))}")
     print("\nDirectory structure:")
     print(f"  {tiff_dir}/")
-    print(f"    observed/")
+    print("    observed/")
     for date in selected_dates:
         print(f"      observed_SPI_{date.strftime('%Y%m')}.tif")
-    print(f"    predictions/")
+    print("    predictions/")
     for model_name in loaded_models.keys():
         print(f"      {model_name}_prediction_SPI_*.tif")
     print("=" * 70)
