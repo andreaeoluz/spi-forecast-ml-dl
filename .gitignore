@@ -7,8 +7,10 @@ __pycache__/
 # Generated experiment artifacts (checkpoints, metrics, figures) - these are
 # reproducible by running main.py and can be tens of GB; never commit them.
 EXPERIMENTS/
-EXPERIMENTS_AREA1/
-EXPERIMENTS_AREA2/
+EXPERIMENTS_AREA*/*
+!EXPERIMENTS_AREA*/metrics/
+EXPERIMENTS_AREA*/metrics/*
+!EXPERIMENTS_AREA*/metrics/*_all_models.xlsx
 panel_figures/
 monthly_maps_test_2025/
 
